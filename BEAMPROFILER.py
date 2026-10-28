@@ -4,8 +4,17 @@ Created on Tue Aug 18 11:13:06 2026
 
 @author: elois
 """
+import XPS_C8_drivers
 import numpy as np
+from newportxps import NewportXPS
 import matplotlib.pyplot as plt
+#import requests
+import os
+#import csv
+import ftplib
+from datetime import datetime
+from XPSHelper import GetGatheringFile, InitXPS
+from scipy.interpolate import griddata
 from scipy.integrate import quad
 #from LinearScanGathering import ExecuteandGather, ReadGathering
 
@@ -263,6 +272,359 @@ ax.set_box_aspect([1, 1, 1])
 
 ax.legend()
 plt.show()
+
+
+xps = InitXPS('192.168.0.254')  
+
+name = 'spiral_scan'
+filename = f"{name}.txt"
+
+
+
+def GenerateSplineTrajectory(filename, separation, radius, upload=True, plot=True):
+    
+    revolutions = radius/separation
+    npoints = int(revolutions*100)
+    
+    theta = np.linspace(0, revolutions*2*np.pi, npoints)
+    radius_values = np.linspace(0, radius, npoints)
+    
+    positions = {
+        'X': radius_values*np.cos(theta),
+        'Y': radius_values*np.sin(theta)}
+    
+    text_lines = []
+
+    for i in range(npoints-1):
+        x = positions['X'][i]
+        y = positions['Y'][i]
+        text_lines.append(f"{x:.8f}, {y:.8f}, {0.00}")
+
+    text = "\n".join(text_lines)
+    
+    first_point = np.array([
+        positions['X'][0],
+        positions['Y'][0],
+        0.00
+    ])
+    
+    if upload:
+        xps.upload_trajectory(filename, text)
+        print(f"Uploaded : {filename}")
+        
+    if plot:
+        plt.close('all')
+        plt.scatter(positions['X'], positions['Y'])
+        plt.xlabel("Horizontal position (mm)")
+        plt.ylabel("Vertical position (mm)")
+        plt.title("Spiral Trajectory")
+        plt.axis('equal')
+        plt.show()
+    
+    return first_point
+
+
+def PrepareTrajectory(start_position):
+    err, ret = xps._xps.GroupMoveAbsolute(
+        xps._sid,
+        'XYZ1',
+        start_position)
+
+    if err != 0:
+        raise RuntimeError(f'GroupMoveAbsolute error: {ret}')
+        
+        
+def ExecuteandGather(filename, timestep, velocity, start_position):
+    PrepareTrajectory(start_position)
+
+    err, ret = xps._xps.GatheringReset(xps._sid)
+    if err != 0:
+        raise RuntimeError(f'GatheringReset error: {ret}')
+        
+    err, ret = xps._xps.GatheringConfigurationSet(xps._sid,
+        ['GatheringTime','XYZ1.X.CurrentPosition',
+        'XYZ1.Y.CurrentPosition', 'XYZ1.Z.CurrentPosition','GPIO4.ADC1'])
+    if err != 0:
+        raise RuntimeError(f'GatheringConfigurationSet error: {ret}')
+        
+    err, ret = xps._xps.EventExtendedConfigurationTriggerSet(xps._sid,
+        ['XYZ1.Spline.TrajectoryStart'],['0'],['0'],['0'],['0'])
+    if err != 0:
+        raise RuntimeError(f'EventExtendedConfigurationTriggerSet error: {ret}')
+
+    err, ret = xps._xps.EventExtendedConfigurationActionSet(xps._sid,
+        ['GatheringRun'], ['8000'], [timestep], ['0'], ['0'])
+    if err != 0:
+        raise RuntimeError(f'EventExtendedConfigurationActionSet error: {ret}')
+
+    err, ret = xps._xps.EventExtendedStart(xps._sid)
+    if err != 0:
+        raise RuntimeError(f'EventExtendedStart error: {ret}')
+        
+    err, ret = xps._xps.XYZSplineExecution(xps._sid,
+        'XYZ1',filename,velocity,100)
+    if err != 0:
+        raise RuntimeError(f'XYZSplineExecution error: {ret}')
+
+    print(xps._xps.GatheringCurrentNumberGet(xps._sid))
+    
+    err, ret = xps._xps.GatheringStopAndSave(xps._sid)
+    if err != 0:
+        raise RuntimeError(f'GatheringStopAndSave error: {ret}')
+
+    xps._xps.EventExtendedRemove(xps._sid, '0')
+    
+    
+def ReadGathering(filepath):
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    header_tokens = []
+    data_start_idx = None
+    for i, line in enumerate(lines[1:], start=1):
+        tokens = line.split()
+        if not tokens:
+            continue
+        try:
+            float(tokens[0])
+            data_start_idx = i
+            break
+        except ValueError:
+            header_tokens.extend(tokens)
+
+    columns = header_tokens
+    data = {col: [] for col in columns}
+
+    for line in lines[data_start_idx:]:
+        tokens = line.split()
+        if not tokens:
+            continue
+        for col, val in zip(columns, tokens):
+            data[col].append(float(val))
+
+    return data
+    
+    
+def FindBeamAxis(limits, approx_focus, waist_radius, far_radius):
+    """
+    Performs one spiral scan at the approximate focus and one at the far
+    z limit. Finds the point of maximum intensity from each scan and
+    returns the two points defining the beam axis.
+    """
+
+    approx_focus = np.array(approx_focus, dtype=float)
+
+    far_focus = np.array([
+        approx_focus[0],
+        approx_focus[1],
+        limits['z'][0] + 1])
+
+    safe_limits = {
+        'x': np.array([limits['x'][0] + 1, limits['x'][1] - 1]),
+        'y': np.array([limits['y'][0] + 1, limits['y'][1] - 1]),
+        'z': np.array([limits['z'][0] + 1, limits['z'][1] - 1])}
+
+    if approx_focus[0] < safe_limits['x'][0] or approx_focus[0] > safe_limits['x'][1]:
+        raise ValueError('Approximate focus X position is outside the safe stage limits')
+
+    if approx_focus[1] < safe_limits['y'][0] or approx_focus[1] > safe_limits['y'][1]:
+        raise ValueError('Approximate focus Y position is outside the safe stage limits')
+
+    if approx_focus[2] < safe_limits['z'][0] or approx_focus[2] > safe_limits['z'][1]:
+        raise ValueError('Approximate focus Z position is outside the safe stage limits')
+
+    if far_focus[0] < safe_limits['x'][0] or far_focus[0] > safe_limits['x'][1]:
+        raise ValueError('Far focus X position is outside the safe stage limits')
+
+    if far_focus[1] < safe_limits['y'][0] or far_focus[1] > safe_limits['y'][1]:
+        raise ValueError('Far focus Y position is outside the safe stage limits')
+
+    if far_focus[2] < safe_limits['z'][0] or far_focus[2] > safe_limits['z'][1]:
+        raise ValueError('Far focus Z position is outside the safe stage limits')
+
+    scan_results = {}
+
+    scans = [
+        ('focus', approx_focus, waist_radius, 'focus_spiral.txt'),
+        ('far', far_focus, far_radius, 'far_spiral.txt')]
+
+    for name, centre, radius, filename in scans:
+
+        print(f'Running {name} spiral')
+        print(f'Centre: {centre}')
+        print(f'Radius: {radius}')
+
+        first_point = GenerateSplineTrajectory(
+            filename,
+            1,
+            radius,
+            upload=True,
+            plot=False)
+
+        ExecuteandGather(
+            filename,
+            '2000',
+            8,
+            centre)
+
+        GetGatheringFile(xps)
+
+        gathering_file = 'Gathering.dat'
+        saved_file = f'{name}_gathering.dat'
+
+        if os.path.exists(saved_file):
+            os.remove(saved_file)
+
+        os.rename(gathering_file, saved_file)
+
+        result = ReadGathering(saved_file)
+
+        X = np.array(result['XYZ1.X.CurrentPosition'])
+        Y = np.array(result['XYZ1.Y.CurrentPosition'])
+        Z = np.array(result['XYZ1.Z.CurrentPosition'])
+        values = np.array(result['GPIO4.ADC1'])
+
+        max_index = np.argmax(values)
+
+        maximum_position = np.array([
+            X[max_index],
+            Y[max_index],
+            Z[max_index]
+        ])
+
+        maximum_value = values[max_index]
+
+        scan_results[name] = {
+            'X': X,
+            'Y': Y,
+            'Z': Z,
+            'values': values,
+            'maximum_position': maximum_position,
+            'maximum_value': maximum_value,
+            'file': saved_file
+        }
+
+        print(f'Maximum intensity: {maximum_value}')
+        print(f'Position: {maximum_position}')
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    for column, name in enumerate(['focus', 'far']):
+
+        result = scan_results[name]
+
+        X = result['X']
+        Y = result['Y']
+        values = result['values']
+        maximum_position = result['maximum_position']
+
+        axes[0, column].scatter(
+            X,
+            Y,
+            c=values,
+            s=5
+        )
+
+        axes[0, column].scatter(
+            maximum_position[0],
+            maximum_position[1],
+            marker='x',
+            s=100
+        )
+
+        axes[0, column].set_xlabel("Horizontal position (mm)")
+        axes[0, column].set_ylabel("Vertical position (mm)")
+        axes[0, column].set_title(f'{name.capitalize()} scan - data points')
+        axes[0, column].axis('equal')
+
+        x = np.linspace(X.min(), X.max(), 500)
+        y = np.linspace(Y.min(), Y.max(), 500)
+
+        xg, yg = np.meshgrid(x, y)
+
+        zg = griddata(
+            (X, Y),
+            values,
+            (xg, yg),
+            method='cubic'
+        )
+
+        axes[1, column].pcolormesh(
+            xg,
+            yg,
+            zg,
+            shading='auto'
+        )
+
+        axes[1, column].scatter(
+            maximum_position[0],
+            maximum_position[1],
+            marker='x',
+            s=100
+        )
+
+        axes[1, column].set_xlabel("Horizontal position (mm)")
+        axes[1, column].set_ylabel("Vertical position (mm)")
+        axes[1, column].set_title(f'{name.capitalize()} scan - interpolated data')
+        axes[1, column].axis('equal')
+
+    plt.tight_layout()
+    plt.show()
+
+    beam_axis = {
+        'focus': scan_results['focus']['maximum_position'],
+        'far': scan_results['far']['maximum_position']
+    }
+
+    print()
+    print(f'Focus position: {beam_axis["focus"]}')
+    print(f'Far position: {beam_axis["far"]}')
+
+    return beam_axis
+
+
+GenerateSplineTrajectory('focus_spiral.txt', 4,40)
+ExecuteandGather('focus_spiral.txt', 2000, 8, [-15,-5,120])
+
+GetGatheringFile(xps)
+
+gathering_file = 'Gathering.dat'
+saved_file = f'{name}_gathering.dat'
+
+if os.path.exists(saved_file):
+    os.remove(saved_file)
+
+os.rename(gathering_file, saved_file)
+
+result = ReadGathering(saved_file)
+
+X = np.array(result['XYZ1.X.CurrentPosition'])
+Y = np.array(result['XYZ1.Y.CurrentPosition'])
+Z = np.array(result['XYZ1.Z.CurrentPosition'])
+values = np.array(result['GPIO4.ADC1'])
+
+max_index = np.argmax(values)
+
+maximum_position = np.array([
+    X[max_index],
+    Y[max_index],
+    Z[max_index]
+])
+
+maximum_value = values[max_index]
+
+scan_results = {
+    'X': X,
+    'Y': Y,
+    'Z': Z,
+    'values': values,
+    'maximum_position': maximum_position,
+    'maximum_value': maximum_value,
+    'file': saved_file
+}
+
+print(f'Maximum intensity: {maximum_value}')
+print(f'Position: {maximum_position}')
 
 '''
 #LIMITS CONSIDERATION
